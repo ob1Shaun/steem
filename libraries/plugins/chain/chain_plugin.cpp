@@ -315,6 +315,7 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
          ("checkpoint,c", bpo::value<vector<string>>()->composing(), "Pairs of [BLOCK_NUM,BLOCK_ID] that should be enforced as checkpoints.")
          ("flush-state-interval", bpo::value<uint32_t>(),
             "flush shared memory changes to disk every N blocks")
+         ("from-state", bpo::value<string>(), "Load from state, then replay subsequent blocks (EXPERIMENTAL)")
          ;
    cli.add_options()
          ("replay-blockchain", bpo::bool_switch()->default_value(false), "clear chain database and replay all blocks" )
@@ -331,7 +332,8 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
          ;
 }
 
-void chain_plugin::plugin_initialize(const variables_map& options) {
+void chain_plugin::plugin_initialize(const variables_map& options)
+{
    my->shared_memory_dir = app().data_dir() / "blockchain";
 
    if( options.count("shared-file-dir") )
@@ -351,8 +353,9 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
    if( options.count( "shared-file-scale-rate" ) )
       my->shared_file_scale_rate = options.at( "shared-file-scale-rate" ).as< uint16_t >();
 
-   my->replay              = options.at( "replay-blockchain").as<bool>();
-   my->resync              = options.at( "resync-blockchain").as<bool>();
+   my->from_state          = options.at( "from-state" ).as<string>();
+   my->replay              = options.at( "replay-blockchain" ).as<bool>();
+   my->resync              = options.at( "resync-blockchain" ).as<bool>();
    my->stop_replay_at      =
       options.count( "stop-replay-at-block" ) ? options.at( "stop-replay-at-block" ).as<uint32_t>() : 0;
    my->benchmark_interval  =
@@ -489,12 +492,13 @@ void chain_plugin::plugin_startup()
          ("pm", measure.peak_mem) );
    };
 
-   if(my->replay)
+   if(my->replay || (my->from_state != ""))
    {
       ilog("Replaying blockchain on user request.");
-      uint32_t last_block_number = 0;
       db_open_args.benchmark = steem::chain::database::TBenchmark(my->benchmark_interval, benchmark_lambda);
-      last_block_number = my->db.reindex( db_open_args );
+      if( my->from_state )
+         my->db.
+      uint32_t last_block_number = my->db.reindex( db_open_args );
 
       if( my->benchmark_interval > 0 )
       {

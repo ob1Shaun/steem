@@ -122,6 +122,7 @@ namespace steem { namespace chain {
           *
           * @param data_dir Path to open or create database in
           */
+         void open( const open_args& args, std::function< void() > genesis_func )
          void open( const open_args& args );
 
          /**

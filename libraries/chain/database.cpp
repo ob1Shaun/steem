@@ -104,6 +104,11 @@ database::~database()
 
 void database::open( const open_args& args )
 {
+   open( args, [&]() { init_genesis( args.initial_supply ); } );
+}
+
+void database::open( const open_args& args, std::function< void() > genesis_func )
+{
    try
    {
       init_schema();
@@ -115,7 +120,7 @@ void database::open( const open_args& args )
       if( !find< dynamic_global_property_object >() )
          with_write_lock( [&]()
          {
-            init_genesis( args.initial_supply );
+            genesis_func();
          });
 
       _benchmark_dumper.set_enabled( args.benchmark_is_enabled );
@@ -187,7 +192,13 @@ uint32_t database::reindex( const open_args& args )
 
       ilog( "Reindexing Blockchain" );
       wipe( args.data_dir, args.shared_mem_dir, false );
-      open( args );
+      open( args, [&]()
+      {
+         if( !args.from_state )
+            init_genesis( args.initial_supply );
+         else
+            init_genesis_from_state( *this, args.state_filename );
+      } );
       _fork_db.reset();    // override effect of _fork_db.start_block() call in open()
 
       auto start = fc::time_point::now();
