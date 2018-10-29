@@ -53,6 +53,8 @@ class rc_plugin_impl
       void on_post_apply_transaction( const transaction_notification& note );
       void on_pre_apply_operation( const operation_notification& note );
       void on_post_apply_operation( const operation_notification& note );
+      void on_pre_apply_optional_action( const optional_action_notification& note );
+      void on_post_apply_optional_action( const optional_action_notification& note );
 
       void on_first_block();
       void validate_database();
@@ -74,6 +76,8 @@ class rc_plugin_impl
       boost::signals2::connection   _post_apply_transaction_conn;
       boost::signals2::connection   _pre_apply_operation_conn;
       boost::signals2::connection   _post_apply_operation_conn;
+      boost::signals2::connection   _pre_apply_optional_action_conn;
+      boost::signals2::connection   _post_apply_optional_action_conn;
 };
 
 inline int64_t get_next_vesting_withdrawal( const account_object& account )
@@ -204,6 +208,13 @@ account_name_type get_resource_user( const signed_transaction& tx )
    return account_name_type();
 }
 
+account_name_type get_resource_user( const optional_automated_action& action )
+{
+   get_resource_user_visitor vtor;
+
+   return action.visit( vtor );
+}
+
 void use_account_rcs(
    database& db,
    const dynamic_global_property_object& gpo,
@@ -322,6 +333,29 @@ void rc_plugin_impl::on_post_apply_transaction( const transaction_notification& 
       export_data->tx_info.push_back( tx_info );
 }
 
+struct block_extensions_count_resources_visitor
+{
+   typedef void result_type;
+
+   count_resources_result& _r;
+
+   block_extensions_count_resources_visitor( count_resources_result& r ) : _r( r ) {}
+
+   // Only optional actions need to be counted. We decided in design that
+   // the operation should pay the cost for any required actions created
+   // as a result.
+   void operator()( const optional_automated_actions& opt_actions )
+   {
+      for( const auto& a : opt_actions )
+      {
+         count_resources( a, _r );
+      }
+   }
+
+   template< typename T >
+   void operator()( const T& ) {}
+};
+
 void rc_plugin_impl::on_post_apply_block( const block_notification& note )
 {
    const dynamic_global_property_object& gpo = _db.get_dynamic_global_properties();
@@ -370,6 +404,12 @@ void rc_plugin_impl::on_post_apply_block( const block_notification& note )
    for( const signed_transaction& tx : note.block.transactions )
    {
       count_resources( tx, count );
+   }
+
+   block_extensions_count_resources_visitor ext_visitor( count );
+   for( const auto& e : note.block.extensions )
+   {
+      e.visit( ext_visitor );
    }
 
    const witness_schedule_object& wso = _db.get_witness_schedule_object();
@@ -511,6 +551,63 @@ account_name_type get_worker_name( const pow2_work& work )
    return work.visit( vtor );
 }
 
+void regenerate( database& db, const account_object& account, const rc_account_object& rc_account, rc_plugin_skip_flags skip )
+{
+   //
+   // Since RC tracking is non-consensus, we must rely on consensus to forbid
+   // transferring / delegating VESTS that haven't regenerated voting power.
+   //
+   // TODO:  Issue number
+   //
+   static_assert( STEEM_RC_REGEN_TIME <= STEEM_VOTING_MANA_REGENERATION_SECONDS, "RC regen time must be smaller than vote regen time" );
+
+   // ilog( "regenerate(${a})", ("a", account.name) );
+
+   manabar_params mbparams;
+   mbparams.max_mana = get_maximum_rc( account, rc_account );
+   mbparams.regen_time = STEEM_RC_REGEN_TIME;
+
+   if( mbparams.max_mana != rc_account.last_max_rc )
+   {
+      if( !skip.skip_reject_unknown_delta_vests )
+      {
+         STEEM_ASSERT( false, plugin_exception,
+            "Account ${a} max RC changed from ${old} to ${new} without triggering an op, noticed on block ${b}",
+            ("a", account.name)("old", rc_account.last_max_rc)("new", mbparams.max_mana)("b", db.head_block_num()) );
+      }
+      else
+      {
+         wlog( "NOTIFYALERT! Account ${a} max RC changed from ${old} to ${new} without triggering an op, noticed on block ${b}",
+            ("a", account.name)("old", rc_account.last_max_rc)("new", mbparams.max_mana)("b", db.head_block_num()) );
+      }
+   }
+
+   db.modify( rc_account, [&]( rc_account_object& rca )
+   {
+      rca.rc_manabar.regenerate_mana< true >( mbparams, db.head_block_time().sec_since_epoch() );
+   } );
+}
+
+template< bool account_may_not_exist = false >
+void regenerate( database& db, const account_name_type& name, rc_plugin_skip_flags skip )
+{
+   const account_object* account = db.find< account_object, by_name >( name );
+   if( account_may_not_exist )
+   {
+      if( account == nullptr )
+         return;
+   }
+   else
+   {
+      FC_ASSERT( account != nullptr, "Unexpectedly, account ${a} does not exist", ("a", name) );
+   }
+
+   const rc_account_object* rc_account = db.find< rc_account_object, by_name >( name );
+   FC_ASSERT( rc_account != nullptr, "Unexpectedly, rc_account ${a} does not exist", ("a", name) );
+
+   regenerate( db, *account, *rc_account, skip );
+}
+
 //
 // This visitor performs the following functions:
 //
@@ -522,8 +619,6 @@ struct pre_apply_operation_visitor
    typedef void result_type;
 
    database&                                _db;
-   uint32_t                                 _current_time = 0;
-   uint32_t                                 _current_block_number = 0;
    account_name_type                        _current_witness;
    fc::optional< price >                    _vesting_share_price;
    rc_plugin_skip_flags                     _skip;
@@ -531,121 +626,64 @@ struct pre_apply_operation_visitor
    pre_apply_operation_visitor( database& db ) : _db(db)
    {}
 
-   void regenerate( const account_object& account, const rc_account_object& rc_account )const
-   {
-      //
-      // Since RC tracking is non-consensus, we must rely on consensus to forbid
-      // transferring / delegating VESTS that haven't regenerated voting power.
-      //
-      // TODO:  Issue number
-      //
-      static_assert( STEEM_RC_REGEN_TIME <= STEEM_VOTING_MANA_REGENERATION_SECONDS, "RC regen time must be smaller than vote regen time" );
-
-      // ilog( "regenerate(${a})", ("a", account.name) );
-
-      manabar_params mbparams;
-      mbparams.max_mana = get_maximum_rc( account, rc_account );
-      mbparams.regen_time = STEEM_RC_REGEN_TIME;
-
-      if( mbparams.max_mana != rc_account.last_max_rc )
-      {
-         if( !_skip.skip_reject_unknown_delta_vests )
-         {
-            STEEM_ASSERT( false, plugin_exception,
-               "Account ${a} max RC changed from ${old} to ${new} without triggering an op, noticed on block ${b}",
-               ("a", account.name)("old", rc_account.last_max_rc)("new", mbparams.max_mana)("b", _db.head_block_num()) );
-         }
-         else
-         {
-            wlog( "NOTIFYALERT! Account ${a} max RC changed from ${old} to ${new} without triggering an op, noticed on block ${b}",
-               ("a", account.name)("old", rc_account.last_max_rc)("new", mbparams.max_mana)("b", _db.head_block_num()) );
-         }
-      }
-
-      _db.modify( rc_account, [&]( rc_account_object& rca )
-      {
-         rca.rc_manabar.regenerate_mana< true >( mbparams, _current_time );
-      } );
-   }
-
-   template< bool account_may_not_exist = false >
-   void regenerate( const account_name_type& name )const
-   {
-      const account_object* account = _db.find< account_object, by_name >( name );
-      if( account_may_not_exist )
-      {
-         if( account == nullptr )
-            return;
-      }
-      else
-      {
-         FC_ASSERT( account != nullptr, "Unexpectedly, account ${a} does not exist", ("a", name) );
-      }
-
-      const rc_account_object* rc_account = _db.find< rc_account_object, by_name >( name );
-      FC_ASSERT( rc_account != nullptr, "Unexpectedly, rc_account ${a} does not exist", ("a", name) );
-
-      regenerate( *account, *rc_account );
-   }
-
    void operator()( const account_create_with_delegation_operation& op )const
    {
-      regenerate( op.creator );
+      regenerate( _db, op.creator, _skip );
    }
 
    void operator()( const transfer_to_vesting_operation& op )const
    {
       account_name_type target = op.to.size() ? op.to : op.from;
-      regenerate( target );
+      regenerate( _db, target, _skip );
    }
 
    void operator()( const withdraw_vesting_operation& op )const
    {
-      regenerate( op.account );
+      regenerate( _db, op.account, _skip );
    }
 
    void operator()( const set_withdraw_vesting_route_operation& op )const
    {
-      regenerate( op.from_account );
+      regenerate( _db, op.from_account, _skip );
    }
 
    void operator()( const delegate_vesting_shares_operation& op )const
    {
-      regenerate( op.delegator );
-      regenerate( op.delegatee );
+      regenerate( _db, op.delegator, _skip );
+      regenerate( _db, op.delegatee, _skip );
    }
 
    void operator()( const author_reward_operation& op )const
    {
-      regenerate( op.author );
+      regenerate( _db, op.author, _skip );
    }
 
    void operator()( const curation_reward_operation& op )const
    {
-      regenerate( op.curator );
+      regenerate( _db, op.curator, _skip );
    }
 
    // Is this one actually necessary?
    void operator()( const comment_reward_operation& op )const
    {
-      regenerate( op.author );
+      regenerate( _db, op.author, _skip );
    }
 
    void operator()( const fill_vesting_withdraw_operation& op )const
    {
-      regenerate( op.from_account );
-      regenerate( op.to_account );
+      regenerate( _db, op.from_account, _skip );
+      regenerate( _db, op.to_account, _skip );
    }
 
    void operator()( const claim_reward_balance_operation& op )const
    {
-      regenerate( op.account );
+      regenerate( _db, op.account, _skip );
    }
 
 #ifdef STEEM_ENABLE_SMT
    void operator()( const claim_reward_balance2_operation& op )const
    {
-      regenerate( op.account );
+      regenerate( _db, op.account, _skip );
    }
 #endif
 
@@ -656,46 +694,48 @@ struct pre_apply_operation_visitor
          const auto& idx = _db.get_index< account_index >().indices().get< by_id >();
          for( auto it=idx.begin(); it!=idx.end(); ++it )
          {
-            regenerate( it->name );
+            regenerate( _db, it->name, _skip );
          }
       }
    }
 
    void operator()( const return_vesting_delegation_operation& op )const
    {
-      regenerate( op.account );
+      regenerate( _db, op.account, _skip );
    }
 
    void operator()( const comment_benefactor_reward_operation& op )const
    {
-      regenerate( op.benefactor );
+      regenerate( _db, op.benefactor, _skip );
    }
 
    void operator()( const producer_reward_operation& op )const
    {
-      regenerate( op.producer );
+      regenerate( _db, op.producer, _skip );
    }
 
    void operator()( const clear_null_account_balance_operation& op )const
    {
-      regenerate( STEEM_NULL_ACCOUNT );
+      regenerate( _db, STEEM_NULL_ACCOUNT, _skip );
    }
 
    void operator()( const pow_operation& op )const
    {
-      regenerate< true >( op.worker_account );
-      regenerate< false >( _current_witness );
+      regenerate< true >( _db, op.worker_account, _skip );
+      regenerate< false >( _db, _current_witness, _skip );
    }
 
    void operator()( const pow2_operation& op )const
    {
-      regenerate< true >( get_worker_name( op.work ) );
-      regenerate< false >( _current_witness );
+      regenerate< true >( _db, get_worker_name( op.work ), _skip );
+      regenerate< false >( _db, _current_witness, _skip );
    }
 
    template< typename Op >
    void operator()( const Op& op )const {}
 };
+
+typedef pre_apply_operation_visitor pre_apply_optional_action_vistor;
 
 struct account_regen_info
 {
@@ -862,6 +902,8 @@ struct post_apply_operation_visitor
    }
 };
 
+typedef post_apply_operation_visitor post_apply_optional_action_visitor;
+
 
 
 void rc_plugin_impl::on_pre_apply_operation( const operation_notification& note )
@@ -876,8 +918,6 @@ void rc_plugin_impl::on_pre_apply_operation( const operation_notification& note 
    if( _db.has_hardfork( STEEM_HARDFORK_0_20 ) )
       vtor._vesting_share_price = gpo.get_vesting_share_price();
 
-   vtor._current_time = gpo.time.sec_since_epoch();
-   vtor._current_block_number = gpo.head_block_number;
    vtor._current_witness = gpo.current_witness;
    vtor._skip = _skip;
 
@@ -917,6 +957,77 @@ void rc_plugin_impl::on_post_apply_operation( const operation_notification& note
    // ilog( "Calling post-vtor on ${op}", ("op", note.op) );
    post_apply_operation_visitor vtor( modified_accounts, _db, now, gpo.head_block_number, gpo.current_witness );
    note.op.visit( vtor );
+
+   update_modified_accounts( _db, modified_accounts );
+}
+
+void rc_plugin_impl::on_pre_apply_optional_action( const optional_action_notification& note )
+{
+   if( before_first_block() )
+      return;
+
+   const dynamic_global_property_object& gpo = _db.get_dynamic_global_properties();
+   pre_apply_optional_action_vistor vtor( _db );
+
+   vtor._current_witness = gpo.current_witness;
+   vtor._skip = _skip;
+
+   note.action.visit( vtor );
+
+   // There is no transaction for actions, so post apply transaction logic for action goes here.
+   int64_t rc_regen = (gpo.total_vesting_shares.amount.value / (STEEM_RC_REGEN_TIME / STEEM_BLOCK_INTERVAL));
+
+   rc_optional_action_info opt_action_info;
+
+   // How many resources does the transaction use?
+   count_resources( note.action, opt_action_info.usage );
+
+   // How many RC does this transaction cost?
+   const rc_resource_param_object& params_obj = _db.get< rc_resource_param_object, by_id >( rc_resource_param_object::id_type() );
+   const rc_pool_object& pool_obj = _db.get< rc_pool_object, by_id >( rc_pool_object::id_type() );
+
+   int64_t total_cost = 0;
+
+   // When rc_regen is 0, everything is free
+   if( rc_regen > 0 )
+   {
+      for( size_t i=0; i<STEEM_NUM_RESOURCE_TYPES; i++ )
+      {
+         const rc_resource_params& params = params_obj.resource_param_array[i];
+         int64_t pool = pool_obj.pool_array[i];
+
+         // TODO:  Move this multiplication to resource_count.cpp
+         opt_action_info.usage.resource_count[i] *= int64_t( params.resource_dynamics_params.resource_unit );
+         opt_action_info.cost[i] = compute_rc_cost_of_resource( params.price_curve_params, pool, opt_action_info.usage.resource_count[i], rc_regen );
+         total_cost += opt_action_info.cost[i];
+      }
+   }
+
+   opt_action_info.resource_user = get_resource_user( note.action );
+   use_account_rcs( _db, gpo, opt_action_info.resource_user, total_cost, _skip );
+
+   std::shared_ptr< exp_rc_data > export_data =
+      steem::plugins::block_data_export::find_export_data< exp_rc_data >( STEEM_RC_PLUGIN_NAME );
+   if( (gpo.head_block_number % 10000) == 0 )
+   {
+      dlog( "${t} : ${i}", ("t", gpo.time)("i", opt_action_info) );
+   }
+   if( export_data )
+      export_data->opt_action_info.push_back( opt_action_info );
+}
+
+void rc_plugin_impl::on_post_apply_optional_action( const optional_action_notification& note )
+{
+   if( before_first_block() )
+      return;
+
+   const dynamic_global_property_object& gpo = _db.get_dynamic_global_properties();
+   const uint32_t now = gpo.time.sec_since_epoch();
+
+   vector< account_regen_info > modified_accounts;
+
+   post_apply_optional_action_visitor vtor( modified_accounts, _db, now, gpo.head_block_number, gpo.current_witness );
+   note.action.visit( vtor );
 
    update_modified_accounts( _db, modified_accounts );
 }
@@ -981,6 +1092,10 @@ void rc_plugin::plugin_initialize( const boost::program_options::variables_map& 
          { try { my->on_pre_apply_operation( note ); } FC_LOG_AND_RETHROW() }, *this, 0 );
       my->_post_apply_operation_conn = db.add_post_apply_operation_handler( [&]( const operation_notification& note )
          { try { my->on_post_apply_operation( note ); } FC_LOG_AND_RETHROW() }, *this, 0 );
+      my->_pre_apply_optional_action_conn = db.add_pre_apply_optional_action_handler( [&]( const optional_action_notification& note )
+         { try { my->on_pre_apply_optional_action( note ); } FC_LOG_AND_RETHROW() }, *this, 0 );
+      my->_post_apply_optional_action_conn = db.add_post_apply_optional_action_handler( [&]( const optional_action_notification& note )
+         { try { my->on_post_apply_optional_action( note ); } FC_LOG_AND_RETHROW() }, *this, 0 );
 
       add_plugin_index< rc_resource_param_index >(db);
       add_plugin_index< rc_pool_index >(db);
@@ -1013,6 +1128,8 @@ void rc_plugin::plugin_shutdown()
    chain::util::disconnect_signal( my->_post_apply_transaction_conn );
    chain::util::disconnect_signal( my->_pre_apply_operation_conn );
    chain::util::disconnect_signal( my->_post_apply_operation_conn );
+   chain::util::disconnect_signal( my->_pre_apply_optional_action_conn );
+   chain::util::disconnect_signal( my->_post_apply_optional_action_conn );
 }
 
 void rc_plugin::set_rc_plugin_skip_flags( rc_plugin_skip_flags skip )
